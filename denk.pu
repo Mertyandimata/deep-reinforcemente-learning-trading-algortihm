@@ -1,0 +1,1006 @@
+Elimde bir deep learning reinformecaaement ile stock alimi satimi yaapan bir kod mevcut, senden istedigim sey kodumu incelemen ve olasi iyilestirilecek fonskiyonlari belirlemen , hataya sebeb verecek veya kotu hesap yapabilecek yerleri bana anlatman , ayni zamanda suan printte sinyal tablosunda tum signaller notr yaziyor , signallerin dagitimi iyi egil ve hata var , burayi cok iyi yapmamiz lazim hatasiz bir baglanti olmali , her class ayri bir py sayfasi , simdi sana bir kac tanesini vereecegim ve bunlari cok detayli incelemeni istiyorum, ve sorunlari coz ve iyilestirmeleri yapalim import numpy as np
+import pandas as pd
+from signal_generator import SignalGenerator
+from tabulate import tabulate
+import logging
+from colorama import Fore, Back, Style, init
+
+init(autoreset=True)  # colorama için otomatik sıfırlama
+
+class StockTradingEnv:
+    def __init__(self, data, initial_balance=10000):
+        self.data = data
+        self.initial_balance = initial_balance
+        self.signal_generator = SignalGenerator(data)
+        self.reset()
+        
+        # Logging ayarları
+        logging.basicConfig(filename='trading_log.txt', level=logging.INFO, 
+                            format='%(asctime)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+        # Action space'i genişlet
+        self.action_space = 11  # 0: Sat, 1-5: Farklı miktarlarda al, 6: Tut
+
+    def reset(self):
+        self.balance = self.initial_balance
+        self.position = 0
+        self.current_step = 0
+        self.total_profit = 0
+        self.entry_price = 0
+        self.stop_loss = 0
+        self.take_profit = 0
+        self.highest_price = 0
+        self.decline_counter = 0  # Gecikme sayacı başlatılıyor
+        self.trades = []
+        self.total_trail_gain = 0
+        self.total_trail_loss = 0
+        return self._next_observation()
+
+
+    def _next_observation(self):
+        signals = self.signal_generator.get_signals(self.current_step)
+        
+        # Extract only the 'value' from the signals
+        signal_values = [data['value'] for data in signals.values()]
+        
+        obs = np.array([
+            self.data['Kapanış(TL)'].iloc[self.current_step],
+            self.data['USDTRY'].iloc[self.current_step],
+            self.data['BIST 100'].iloc[self.current_step],
+            self.data['PiyasaDeğeri(mn TL)'].iloc[self.current_step],
+            self.balance,
+            self.position,
+            self.total_profit,
+            self.entry_price,
+            self.stop_loss,
+            self.take_profit,
+            (self.stop_loss - self.data['Kapanış(TL)'].iloc[self.current_step]) / self.data['Kapanış(TL)'].iloc[self.current_step],
+            (self.take_profit - self.data['Kapanış(TL)'].iloc[self.current_step]) / self.data['Kapanış(TL)'].iloc[self.current_step],
+        ] + signal_values + [sum(signal_values)])  # Now signal_values is a list of floats, so sum works
+
+        return obs
+
+
+    def step(self, action):
+        prev_value = self.balance + self.position * self.data['Kapanış(TL)'].iloc[self.current_step]
+        
+        self._take_action(action)
+        self.current_step += 1
+        done = self.current_step >= len(self.data) - 1
+        
+        obs = self._next_observation()
+
+        # Burada toplam sinyali hesaplayıp alıyoruz
+        total_signal = self.signal_generator.get_total_signal(self.current_step)
+
+        current_value = self.balance + self.position * self.data['Kapanış(TL)'].iloc[self.current_step]
+        reward = self._calculate_reward(prev_value, current_value)
+        self.total_profit += current_value - prev_value
+        
+        info = {
+            'step': self.current_step,
+            'balance': current_value,
+            'profit': self.total_profit,
+            'reward': reward,
+            'position': self.position,
+            'action': action,
+            'price': self.data['Kapanış(TL)'].iloc[self.current_step],
+            'stop_loss': self.stop_loss,
+            'take_profit': self.take_profit,
+            'total_trail_gain': self.total_trail_gain,
+            'total_trail_loss': self.total_trail_loss,
+            'total_signal': total_signal  # Yeni eklenen satır
+        }
+
+        self._print_step_info(info)
+        self._log_step_info(info)
+
+        return obs, reward, done, info
+
+
+    # Gecikmeli pozisyon kapatma
+    def _take_action(self, action):
+        current_price = self.data['Kapanış(TL)'].iloc[self.current_step]
+        
+        # Sinyal doğrulama
+        signals = self.signal_generator.get_signals(self.current_step)
+        positive_signals = sum(1 for data in signals.values() if data['value'] > 0)
+        negative_signals = sum(1 for data in signals.values() if data['value'] < 0)
+        
+        total_signal = self.signal_generator.get_total_signal(self.current_step)
+        
+        # Alım işlemi
+        if positive_signals >= 3 and action in [1, 2, 3] and total_signal > 0:
+            if self.position == 0:
+                self._open_position(current_price)
+        
+        # Gecikmeli satış işlemi: Pozisyon kapanmadan önce 2 bar bekleme
+        elif negative_signals >= 3 and action == 0 and total_signal < 0:
+            if self.position > 0 and self.current_step - self.decline_counter >= 2:
+                self._close_position(current_price)
+            else:
+                self.decline_counter += 1  # Gecikme için adım sayacı
+
+
+
+
+    def _open_position(self, price, buy_percentage=1.0):
+        max_shares = int((self.balance * buy_percentage) // price)
+        risk_percentage = self._calculate_dynamic_risk()
+        buy_amount = self._calculate_buy_amount()
+        shares_to_buy = max(1, int(max_shares * min(risk_percentage, buy_amount)))
+        cost = shares_to_buy * price
+        if cost <= self.balance:
+            self.position += shares_to_buy
+            self.balance -= cost
+            self.entry_price = price
+            self.highest_price = price
+            self.decline_counter = 0
+            
+            self._set_dynamic_stop_loss_take_profit(price)
+            
+            self.trades.append({'type': 'buy', 'price': price, 'shares': shares_to_buy, 'step': self.current_step})
+            
+            print(f"\n{Fore.GREEN}🛒 ALIŞ İŞLEMİ GERÇEKLEŞTI{Style.RESET_ALL}")
+            print(tabulate([
+                ["Alınan Hisse Adedi", f"{shares_to_buy:,}"],
+                ["Alış Fiyatı", f"{price:,.2f} TL"],
+                ["Toplam Maliyet", f"{cost:,.2f} TL"],
+                ["Yeni Nakit Bakiye", f"{self.balance:,.2f} TL"],
+                ["Stop-Loss", f"{self.stop_loss:,.2f} TL"],
+                ["Take-Profit", f"{self.take_profit:,.2f} TL"]
+            ], tablefmt="fancy_grid"))
+
+    def _close_position(self, price):
+        sell_value = self.position * price
+        profit = sell_value - (self.position * self.entry_price)
+        self.balance += sell_value
+        
+        if price >= self.take_profit:
+            self.total_trail_gain += (price - self.entry_price) * self.position
+        elif price <= self.stop_loss:
+            self.total_trail_loss += (self.entry_price - price) * self.position
+
+        self.trades.append({'type': 'sell', 'price': price, 'shares': self.position, 'step': self.current_step})
+
+        print(f"\n{Fore.RED}💰 SATIŞ İŞLEMİ GERÇEKLEŞTI{Style.RESET_ALL}")
+        print(tabulate([
+            ["Satılan Hisse Adedi", f"{self.position:,}"],
+            ["Satış Fiyatı", f"{price:,.2f} TL"],
+            ["Toplam Değer", f"{sell_value:,.2f} TL"],
+            ["Kâr/Zarar", f"{profit:,.2f} TL"],
+            ["Yeni Nakit Bakiye", f"{self.balance:,.2f} TL"]
+        ], tablefmt="fancy_grid"))
+        
+        self.position = 0
+        self.entry_price = 0
+        self.stop_loss = 0
+        self.highest_price = 0
+
+    def _calculate_reward(self, prev_value, current_value):
+        if prev_value == 0:
+            return 0
+        
+        # Temel ödül: Portföy değerindeki değişim
+        base_reward = (current_value - prev_value) / prev_value * 100
+        
+        # Piyasa koşullarına göre ödül ayarlaması
+        market_trend = self._calculate_market_trend()
+        if (market_trend > 0 and base_reward > 0) or (market_trend < 0 and base_reward < 0):
+            base_reward *= 2.2  # Trend ile uyumlu hareket ettiğinde bonus
+        else:
+            base_reward *= 0.8  # Trende karşı hareket ettiğinde ceza
+        
+        # Risk yönetimi ödülü
+        risk_reward = self._calculate_risk_reward()
+        
+        # Uzun vadeli performans ödülü
+        long_term_reward = self._calculate_long_term_reward()
+        
+        # Teknik gösterge uyumu ödülü
+        technical_reward = self._calculate_technical_indicator_reward()
+        
+        # Toplam ödül hesaplama
+        total_reward = base_reward + risk_reward + long_term_reward + technical_reward
+        
+        # Ödül bileşenlerini yazdırma
+        print(f"\n💹 Temel Ödül: {base_reward:.2f}")
+        print(f"🛡️ Risk Yönetimi Ödülü: {risk_reward:.2f}")
+        print(f"📈 Uzun Vadeli Performans Ödülü: {long_term_reward:.2f}")
+        print(f"📊 Teknik Gösterge Uyumu Ödülü: {technical_reward:.2f}")
+        print(f"🏆 Toplam Ödül: {total_reward:.2f}")
+        
+        if total_reward > 0:
+            print(f"{Fore.GREEN}✅ Robot etkili bir karar aldı!{Style.RESET_ALL}")
+        elif total_reward < 0:
+            print(f"{Fore.RED}❌ Robot iyileştirme gerektiren bir karar aldı.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}➖ Robot nötr bir karar aldı.{Style.RESET_ALL}")
+        
+        return total_reward
+    
+    def _calculate_risk_reward(self):
+        if self.position == 0:
+            return 0
+        
+        current_price = self.data['Kapanış(TL)'].iloc[self.current_step]
+        risk = abs(self.entry_price - self.stop_loss)
+        reward = abs(self.take_profit - self.entry_price)
+        
+        if risk == 0:
+            return 0
+        
+        risk_reward_ratio = reward / risk
+        
+        if current_price >= self.take_profit:
+            return 10 * risk_reward_ratio  # Take-profit'e ulaşıldığında büyük ödül
+        elif current_price <= self.stop_loss:
+            return -5 * (1 / risk_reward_ratio)  # Stop-loss'a ulaşıldığında büyük ceza
+        else:
+            return 2 * risk_reward_ratio  # Pozisyon devam ederken küçük ödül
+
+    def _calculate_long_term_reward(self):
+        if len(self.trades) < 10:
+            return 0
+        
+        recent_trades = self.trades[-10:]
+        profitable_trades = sum(1 for trade in recent_trades if trade['type'] == 'sell' and trade['price'] > trade['price'])
+        return (profitable_trades / 10 - 0.5) * 10  # -5 ile 5 arasında bir değer
+
+    def _calculate_technical_indicator_reward(self):
+        signals = self.signal_generator.get_signals(self.current_step)
+        
+        # Extract only the 'value' from the signal dictionaries for summing
+        signal_values = [data['value'] for data in signals.values()]
+        
+        # Now sum the signal values
+        total_signal = sum(signal_values)
+        
+        # Check the alignment of signals with the current position
+        if (total_signal > 0 and self.position > 0) or (total_signal < 0 and self.position == 0):
+            return 5  # Technical indicators aligned with the position
+        elif (total_signal < 0 and self.position > 0) or (total_signal > 0 and self.position == 0):
+            return -5  # Technical indicators not aligned with the position
+        else:
+            return 0  # Neutral case
+
+        
+    def _calculate_market_trend(self):
+        # 50 ve 100 günlük hareketli ortalamaları kullanarak trendi tespit et
+        ma_50 = self.data['Kapanış(TL)'].rolling(window=20).mean().iloc[self.current_step]
+        ma_100 = self.data['Kapanış(TL)'].rolling(window=50).mean().iloc[self.current_step]
+        current_price = self.data['Kapanış(TL)'].iloc[self.current_step]
+        
+        # Trend tespiti: fiyat, uzun vadeli ortalamanın üstündeyse yükseliş, altındaysa düşüş
+        if current_price > ma_50 and ma_50 > ma_100:
+            return 1  # Yükseliş trendi
+        elif current_price < ma_50 and ma_50 < ma_100:
+            return -1  # Düşüş trendi
+        else:
+            return 0  # Yatay trend
+
+
+    def _update_trailing_stop_and_profit(self, current_price):
+        high = self.data['Max(TL)'].iloc[self.current_step]
+        low = self.data['Min(TL)'].iloc[self.current_step]
+        
+        if self.current_step == 0:
+            prev_close = self.data['Kapanış(TL)'].iloc[self.current_step]
+        else:
+            prev_close = self.data['Kapanış(TL)'].iloc[self.current_step - 1]
+        
+        true_range = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        atr = true_range
+
+        atr_multiplier = 2
+        new_stop_loss = current_price - (atr * atr_multiplier)
+
+        if current_price > self.highest_price:
+            self.highest_price = current_price
+            self.stop_loss = max(self.stop_loss, new_stop_loss)
+            print(f"\n{Fore.YELLOW}📈 YENİ EN YÜKSEK FİYAT VE STOP-LOSS{Style.RESET_ALL}")
+            print(tabulate([
+                ["Yeni En Yüksek Fiyat", f"{current_price:,.2f} TL"],
+                ["Yeni Stop-Loss", f"{self.stop_loss:,.2f} TL"]
+            ], tablefmt="fancy_grid"))
+        elif current_price < self.highest_price:
+            print(f"\n{Fore.YELLOW}📉 FİYAT DÜŞÜŞÜ{Style.RESET_ALL}")
+            print(tabulate([
+                ["Mevcut Fiyat", f"{current_price:,.2f} TL"],
+                ["Mevcut Stop-Loss", f"{self.stop_loss:,.2f} TL"]
+            ], tablefmt="fancy_grid"))
+
+    def _get_signal_status(self, signal_value):
+        try:
+            # Öncelikle signal_value'nun sayısal bir değer olduğundan emin olalım
+            signal_value = float(signal_value)
+        except ValueError:
+            return f"⚪ Geçersiz Sinyal ({signal_value})"  # Eğer sayısal bir değer değilse
+
+        abs_value = abs(signal_value)
+        
+        if abs_value > 0.7:
+            return f"🟢 Güçlü Al ({signal_value:.4f})" if signal_value > 0 else f"🔴 Güçlü Sat ({signal_value:.4f})"
+        elif abs_value > 0.5:
+            return f"🟡 Al ({signal_value:.4f})" if signal_value > 0 else f"🟠 Sat ({signal_value:.4f})"
+        elif abs_value > 0.3:
+            return f"🟡 Zayıf Al ({signal_value:.4f})" if signal_value > 0 else f"🟠 Zayıf Sat ({signal_value:.4f})"
+        elif abs_value > 0.1:
+            return f"⚪ Zayıf Al ({signal_value:.4f})" if signal_value > 0 else f"⚪ Zayıf Sat ({signal_value:.4f})"
+        else:
+            return f"⚪ Nötr ({signal_value:.4f})"
+
+
+
+
+    def _get_robot_decision(self, action):
+        if action == 0:
+            return "🔴 Sat"
+        elif 1 <= action <= 3:
+            return "🟡 Az Al"
+        elif 4 <= action <= 7:
+            return "🟢 Orta Al"
+        elif 8 <= action <= 10:
+            return "🔵 Çok Al"
+        else:
+            return "⚪ Tut"
+
+
+    def _print_step_info(self, info):
+        action_emoji = {0: "🔴", 1: "🟡", 2: "🟠", 3: "🟢", 4: "🔵", 5: "🟣", 6: "⚪", 7: "🟤", 8: "⚫", 9: "🟥", 10: "🟩"}
+        signal_status = self._get_signal_status(info['total_signal'])
+        robot_decision = self._get_robot_decision(info['action'])
+        
+        print(f"\n{'='*100}")
+        print(f"{Fore.CYAN}📊 ADIM BİLGİLERİ - Adım {info['step']}{Style.RESET_ALL}")
+        
+        # Adım bilgileri tablosu
+        step_table = tabulate([
+            ["Mevcut Fiyat", f"{info['price']:,.2f} TL"],
+            ["Portföy Değeri", f"{info['balance']:,.2f} TL"],
+            ["Nakit Bakiye", f"{self.balance:,.2f} TL"],
+            ["Pozisyon", f"{info['position']:,} adet"],
+            ["Toplam Kâr/Zarar", f"{info['profit']:,.2f} TL"],
+            ["Son İşlem Kârı", f"{(info['balance'] - (self.balance + info['position'] * info['price'])):,.2f} TL"],
+            ["Stop-Loss", f"{info['stop_loss']:,.2f} TL"],
+            ["Take-Profit", f"{info['take_profit']:,.2f} TL"],
+            ["Takipten Kazanç", f"{info['total_trail_gain']:,.2f} TL"],
+            ["Takipten Kayıp", f"{info['total_trail_loss']:,.2f} TL"],
+            ["Aksiyon", f"{action_emoji[info['action']]} ({info['action']})"],
+            ["Ödül", f"{info['reward']:,.2f}"],
+            ["Genel Sinyal", f"{signal_status}"],
+            ["Robot Kararı", f"{robot_decision}"]
+        ], tablefmt="fancy_grid")
+
+        # Sinyal bilgileri tablosu
+        signals = self.signal_generator.get_signals(self.current_step)
+        signal_table = tabulate([
+            [signal, f"{data['value']:.4f}", self._get_signal_status(data['value'])] for signal, data in signals.items()
+        ], headers=["Sinyal", "Değer", "Durum"], tablefmt="fancy_grid")
+
+        # Her iki tabloyu da aynı genişlikte ve düzgün şekilde yazdırma
+        step_lines = step_table.split('\n')
+        signal_lines = signal_table.split('\n')
+        
+        # En uzun tabloya göre satır sayısını eşitleme
+        max_lines = max(len(step_lines), len(signal_lines))
+        step_lines += [' ' * len(step_lines[0])] * (max_lines - len(step_lines))
+        signal_lines += [' ' * len(signal_lines[0])] * (max_lines - len(signal_lines))
+        
+        # Satırları yan yana yazdırma
+        for step_line, signal_line in zip(step_lines, signal_lines):
+            print(f"{step_line}    {signal_line}")
+
+        # Market trendini hesaplayıp yazdırma
+        market_trend = self._calculate_market_trend()
+        if market_trend > 0.5:
+            trend_desc = "📈 Sert Artıyor"
+        elif market_trend > 0:
+            trend_desc = "📈 Artıyor"
+        elif market_trend < -0.5:
+            trend_desc = "📉 Sert Azalıyor"
+        elif market_trend < 0:
+            trend_desc = "📉 Azalıyor"
+        else:
+            trend_desc = "➖ Nötr"
+
+        print(f"\n{Fore.MAGENTA}📊 Market Trend: {trend_desc}{Style.RESET_ALL}")
+        print(f"{'='*100}\n")
+
+
+    def _log_step_info(self, info):
+        log_message = (
+            f"Adım: {info['step']} | "
+            f"Fiyat: {info['price']:.2f} TL | "
+            f"Portföy: {info['balance']:.2f} TL | "
+            f"Pozisyon: {info['position']} | "
+            f"Kâr/Zarar: {info['profit']:.2f} TL | "
+            f"Stop-Loss: {info['stop_loss']:.2f} TL | "
+            f"Take-Profit: {info['take_profit']:.2f} TL | "
+            f"Aksiyon: {info['action']} | "
+            f"Ödül: {info['reward']:.2f}"
+        )
+        logging.info(log_message)
+
+        # Sinyal ağırlıklarını da logla
+        signals = self.signal_generator.get_signals(self.current_step)
+        signal_table = tabulate([
+            [signal, f"{data['value']:.4f}", data['status']] for signal, data in signals.items()
+        ], headers=["Sinyal", "Değer", "Durum"], tablefmt="fancy_grid")
+        
+        for signal, data in signals.items():
+            logging.info(f"Sinyal: {signal} | Ağırlık: {data['value']:.4f}")
+
+
+    def _calculate_dynamic_risk(self):
+        try:
+            # total_signal'ı sayısal bir değere dönüştür
+            total_signal = float(self.signal_generator.get_total_signal(self.current_step))
+        except ValueError:
+            print("Geçersiz total_signal değeri. Varsayılan risk seviyesi kullanılacak.")
+            return 0.2  # Eğer sayısal bir değer değilse, varsayılan bir risk seviyesi döndürülebilir.
+
+        if total_signal > 0.5:
+            return 0.45  # Yüksek risk
+        elif total_signal < -0.5:
+            return 0.1  # Düşük risk
+        else:
+            return 0.2  # Orta risk
+
+
+    def _is_in_downtrend(self):
+        current_price = self.data['Kapanış(TL)'].iloc[self.current_step]
+        ma_50 = self.data['Kapanış(TL)'].rolling(window=50).mean().iloc[self.current_step]
+        return current_price < ma_50
+    
+    def _calculate_buy_amount(self):
+        # Son 10 günlük fiyat değişimi
+        price_change = self.data['Kapanış(TL)'].pct_change(periods=10).iloc[self.current_step]
+        
+        # 50 günlük hareketli ortalama
+        ma_50 = self.data['Kapanış(TL)'].rolling(window=50).mean().iloc[self.current_step]
+        
+        # Mevcut fiyat
+        current_price = self.data['Kapanış(TL)'].iloc[self.current_step]
+        
+        # 20 günlük volatilite
+        volatility = self.data['Kapanış(TL)'].pct_change().rolling(window=20).std().iloc[self.current_step]
+        
+        # Piyasa trendi (1: yükseliş, -1: düşüş, 0: yatay)
+        trend = 1 if current_price > ma_50 else (-1 if current_price < ma_50 else 0)
+        
+        # Mevcut portföy değeri
+        portfolio_value = self.balance + (self.position * current_price)
+        
+        # Temel alım yüzdesi
+        base_buy_percentage = 0.9  # Yüksek alım yüzdesi
+
+        # Trend bazlı ayarlama
+        if trend == 1:
+            base_buy_percentage *= 1.3  # Yükseliş trendinde daha fazla alım
+        elif trend == -1:
+            base_buy_percentage *= 0.9  # Düşüş trendinde daha az alım
+
+        # Fiyat değişimine göre ayarlama
+        if price_change < -0.05:
+            base_buy_percentage *= 1.5  # Büyük düşüşlerde daha fazla alım
+        elif price_change < -0.03:
+            base_buy_percentage *= 1.2  # Orta düşüşlerde daha fazla alım
+
+        # Volatiliteye göre ayarlama
+        if volatility > 0.03:  # Yüksek volatilite
+            base_buy_percentage *= 1.1  # Volatilite varsa daha fazla alım yap
+
+        # Maksimum alım yüzdesini artır
+        max_buy_percentage = 0.9  # Maksimum alım yüzdesini %90 yap
+        buy_percentage = min(base_buy_percentage, max_buy_percentage)
+        
+        # Toplam portföy değerinin en fazla %90'ını riske at
+        max_risk_amount = portfolio_value * 0.9  # Maksimum risk oranını artır
+        buy_amount = min(self.balance * buy_percentage, max_risk_amount)
+
+        # Minimum 5000 TL'lik alım yapılmasını garanti etmek için bir minimum değer belirle
+        min_alim_miktari = 5000  # En az 5000 TL'lik alım yapılmasını sağla
+        buy_amount = max(buy_amount, min_alim_miktari)
+        
+        return buy_amount / self.balance  # Oran olarak döndür
+
+
+
+
+
+    def _set_dynamic_stop_loss_take_profit(self, price):
+        # ATR'yi hesaplayalım ve volatiliteyi belirleyelim
+        atr_value = self._calculate_atr()
+        volatility = self.data['Kapanış(TL)'].pct_change().rolling(window=20).std().iloc[self.current_step]
+        
+        # Volatiliteye göre stop-loss ve take-profit seviyelerini belirleyelim
+        if volatility > 0.03:  # Yüksek volatilite
+            self.stop_loss = price - (4 * atr_value)  # ATR bazlı dinamik stop-loss
+            self.take_profit = price + (5 * atr_value)
+        else:  # Düşük volatilite
+            self.stop_loss = price - (3 * atr_value)
+            self.take_profit = price + (4 * atr_value)
+        
+        # Fiyatı izleyerek dinamik stop-loss ve kâr kilitleme mekanizması
+        if price > self.highest_price:
+            self.highest_price = price
+            print(f"\n{Fore.GREEN}📈 Yeni En Yüksek Fiyat: {price:,.2f} TL. Stop-loss güncellendi.{Style.RESET_ALL}")
+        
+        # Kârı korumak için kademeli satış mekanizması
+        if price <= self.highest_price * 0.95 and self.position > 0:
+            print(f"\n{Fore.RED}⚠️ Fiyat en yüksek seviyeden %5 düştü. Pozisyonun %50'sini satıyoruz.{Style.RESET_ALL}")
+            self._close_partial_position(price, sell_percentage=0.5)
+        
+        if price <= self.highest_price * 0.90 and self.position > 0:
+            print(f"\n{Fore.RED}⚠️ Fiyat en yüksek seviyeden %10 düştü. Kalan tüm pozisyonu kapatıyoruz.{Style.RESET_ALL}")
+            self._close_position(price)
+        
+        # Stop-loss ve take-profit seviyelerini gösterelim
+        print(f"\n{Fore.YELLOW}📊 Güncel Stop-Loss ve Take-Profit Seviyeleri{Style.RESET_ALL}")
+        print(tabulate([
+            ["En Yüksek Fiyat", f"{self.highest_price:,.2f} TL"],
+            ["Yeni Stop-Loss", f"{self.stop_loss:,.2f} TL"],
+            ["Yeni Take-Profit", f"{self.take_profit:,.2f} TL"]
+        ], tablefmt="fancy_grid"))
+
+
+    def _close_partial_position(self, price, sell_percentage=0.5):
+        shares_to_sell = int(self.position * sell_percentage)
+        sell_value = shares_to_sell * price
+        self.balance += sell_value
+        self.position -= shares_to_sell
+        
+        profit = sell_value - (shares_to_sell * self.entry_price)
+        
+        print(f"\n{Fore.RED}💰 KISMİ SATIŞ GERÇEKLEŞTİ{Style.RESET_ALL}")
+        print(tabulate([
+            ["Satılan Hisse Adedi", f"{shares_to_sell:,}"],
+            ["Satış Fiyatı", f"{price:,.2f} TL"],
+            ["Toplam Değer", f"{sell_value:,.2f} TL"],
+            ["Kâr/Zarar", f"{profit:,.2f} TL"],
+            ["Yeni Nakit Bakiye", f"{self.balance:,.2f} TL"]
+        ], tablefmt="fancy_grid"))
+
+
+
+
+    def _calculate_atr(self, window=14):
+        high = self.data['Max(TL)']
+        low = self.data['Min(TL)']
+        close = self.data['Kapanış(TL)']
+        
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=window).mean()
+        
+        return atr.iloc[self.current_step]
+
+    def calculate_sharpe_ratio(self):
+        if len(self.trades) < 2:
+            return 0
+
+        returns = [(t['price'] / t['price'] - 1) for t in self.trades if t['type'] == 'sell']
+        if not returns:
+            return 0
+
+        return np.sqrt(252) * np.mean(returns) / np.std(returns)
+
+    def calculate_max_drawdown(self):
+        peak = self.initial_balance
+        max_drawdown = 0
+
+        for trade in self.trades:
+            if trade['type'] == 'sell':
+                current_value = trade['price'] * trade['shares']
+                if current_value > peak:
+                    peak = current_value
+                drawdown = (peak - current_value) / peak
+                max_drawdown = max(max_drawdown, drawdown)
+
+        return max_drawdown
+
+    def calculate_win_loss_ratio(self):
+        wins = sum(1 for t in self.trades if t['type'] == 'sell' and t['price'] > t['price'])
+        losses = sum(1 for t in self.trades if t['type'] == 'sell' and t['price'] <= t['price'])
+        return wins / losses if losses > 0 else float('inf')
+
+    def calculate_profit_factor(self):
+        gross_profit = sum(t['price'] * t['shares'] - t['price'] * t['shares'] for t in self.trades if t['type'] == 'sell' and t['price'] > t['price'])
+        gross_loss = sum(t['price'] * t['shares'] - t['price'] * t['shares'] for t in self.trades if t['type'] == 'sell' and t['price'] <= t['price'])
+        return gross_profit / abs(gross_loss) if gross_loss != 0 else float('inf')
+
+    def get_performance_metrics(self):
+        return {
+            "Sharpe Ratio": self.calculate_sharpe_ratio(),
+            "Max Drawdown": self.calculate_max_drawdown(),
+            "Win/Loss Ratio": self.calculate_win_loss_ratio(),
+            "Profit Factor": self.calculate_profit_factor()
+        }
+
+    def print_performance_summary(self):
+        metrics = self.get_performance_metrics()
+        print(f"\n{Fore.CYAN}📈 PERFORMANS ÖZETI{Style.RESET_ALL}")
+        print(tabulate([(k, f"{v:.2f}") for k, v in metrics.items()], tablefmt="fancy_grid"))
+
+    def get_state_size(self):
+        return len(self._next_observation())
+
+    def get_action_size(self):
+        return self.action_space
+
+# StockTradingEnv sınıfı burada sona eriyor,import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from ta.trend import EMAIndicator, MACD, IchimokuIndicator, PSARIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
+from collections import deque
+from nbar_detector import NBARReversalDetector
+from order_blocks import OrderBlockDetector
+
+
+class SignalGenerator:
+    def __init__(self, data):
+        self.data = data
+        self.signals = {}
+        self.weights = {}
+        self.usage_count = {}
+        self.reward_history = {}
+        self.reward_deque = {}
+        self.performance_score = {}
+        self.n_steps_for_reward_avg = 10  # Ağırlık güncellemelerinde ortalamayı kullanma periyodu
+        self.nbar_detector = NBARReversalDetector(data, use_volume=True, use_atr=True)
+        self.ob_detector = OrderBlockDetector(data)
+        self.ob_detector.detect_order_blocks()
+
+        self.initialize_signals()
+        self.initialize_weights()
+
+    def initialize_signals(self):
+        # Tüm sinyallerin başlatılması
+        self.signals['Adaptive_SuperTrend'] = self.adaptive_supertrend()
+        self.signals['EMA_5_10'] = self.ema_crossover(5, 10)
+        self.signals['EMA_10_21'] = self.ema_crossover(10, 21)
+        self.signals['MACD'] = self.macd_signal()
+        self.signals['RSI'] = self.rsi_signal()
+        self.signals['BB'] = self.bollinger_bands_signal()
+        self.signals['PSAR'] = self.psar_signal()
+        self.signals['NBAR'] = self.nbar_signal()
+        self.signals['OrderBlocks'] = self.order_blocks_signal()
+        self.signals['Ichimoku'] = self.ichimoku_signal()
+        self.signals['Stochastic'] = self.stochastic_signal()
+        self.signals['OBV'] = self.obv_signal()
+        self.signals['Support_Resistance'] = self.support_resistance_signal()
+
+    def initialize_weights(self):
+        total_signals = len(self.signals)
+        for signal in self.signals:
+            if signal == 'Adaptive_SuperTrend':
+                self.weights[signal] = 0.5  # Adaptive SuperTrend'in ağırlığını her zaman 0.5 yap
+            elif signal == 'OrderBlocks':
+                self.weights[signal] = 0.1  # Order Blocks için ağırlığı daha düşük yap
+            else:
+                self.weights[signal] = (1.0 - 0.5 - 0.1) / (total_signals - 2)  # Diğer sinyallerin ağırlığını dengeli dağıt
+            self.usage_count[signal] = 0
+            self.reward_history[signal] = []
+            self.reward_deque[signal] = deque(maxlen=self.n_steps_for_reward_avg)
+            self.performance_score[signal] = 0.5  # Başlangıç performans skoru
+
+
+    # Doğrusal ağırlıklandırma
+    def linear_weighting(self, performance_score):
+        return performance_score  
+
+    # Logaritmik ağırlıklandırma
+    def logarithmic_weighting(self, performance_score):
+        return np.log1p(performance_score)
+
+    # Üssel ağırlıklandırma
+    def exponential_weighting(self, performance_score):
+        return np.exp(performance_score)
+
+    def update_weights(self, rewards, method='linear'):
+        """
+        Ağırlıkları performans skoruna göre günceller.
+        :param rewards: Her sinyalin aldığı ödüller.
+        :param method: 'linear', 'logarithmic' ya da farklı ağırlıklandırma metodları.
+        """
+        # Seçilen metodun fonksiyonunu haritadan alalım
+        method_map = {
+            'linear': self.linear_weighting,
+            'logarithmic': self.logarithmic_weighting,
+            'exponential': self.exponential_weighting  # Ekstra metodlar buraya eklenebilir
+        }
+
+        if method not in method_map:
+            raise ValueError(f"Invalid method. Available methods are: {list(method_map.keys())}")
+
+        # Seçilen metodun fonksiyonunu çekiyoruz
+        weighting_function = method_map[method]
+
+        for signal, reward in rewards.items():
+            if signal != 'Adaptive_SuperTrend':  # Adaptif SuperTrend sabit kalabilir
+                self.reward_deque[signal].append(reward)
+                avg_reward = np.mean(self.reward_deque[signal])
+
+                # Performans skorunu güncelle
+                self.performance_score[signal] = self.performance_score[signal] * 0.95 + (0.05 * (1 if avg_reward > 0 else 0))
+
+                # Seçilen metodun fonksiyonunu kullanarak yeni ağırlığı hesapla
+                new_weight = weighting_function(self.performance_score[signal])
+
+                # Minimum ağırlık sınırı koy
+                self.weights[signal] = max(0.01, new_weight)
+
+        # Adaptive SuperTrend'in ağırlığını sabit tut
+        self.weights['Adaptive_SuperTrend'] = 0.5
+
+        # Nötr sinyalleri (ağırlık değeri 0'a yakın olanları) ayıkla ve diğerlerini normalize et
+        total_weight = sum(w for s, w in self.weights.items() if s != 'Adaptive_SuperTrend' and abs(w) > 0.05)
+
+        # Toplam ağırlığın 1 olmasını sağlamak için normalize et
+        for signal in self.weights:
+            if signal != 'Adaptive_SuperTrend' and abs(self.weights[signal]) > 0.05:
+                self.weights[signal] /= total_weight
+                self.weights[signal] *= 0.5  # Kalan ağırlıkları Adaptive_SuperTrend'e göre normalize et
+
+
+    def adaptive_supertrend(self, atr_period=10, factor=3, training_period=100):
+        """ Adaptif SuperTrend sinyali """
+        high = self.data['Max(TL)']
+        low = self.data['Min(TL)']
+        close = self.data['Kapanış(TL)']
+
+        atr_indicator = AverageTrueRange(high=high, low=low, close=close, window=atr_period)
+        atr = atr_indicator.average_true_range()
+
+        volatility = atr.rolling(training_period).mean()
+        volatility_array = volatility.dropna().values.reshape(-1, 1)
+
+        kmeans = KMeans(n_clusters=3, random_state=42)
+        kmeans.fit(volatility_array)
+
+        sorted_centers = np.sort(kmeans.cluster_centers_, axis=0)
+        low_volatility, medium_volatility, high_volatility = sorted_centers.ravel()
+
+        hl2 = (high + low) / 2
+        supertrend = pd.Series(index=close.index, dtype='float64')
+        direction = pd.Series(index=close.index, dtype='int')
+
+        for i in range(len(close)):
+            if i < training_period:
+                supertrend.iloc[i] = np.nan
+                direction.iloc[i] = 0
+                continue
+
+            current_volatility = volatility.iloc[i]
+            if current_volatility <= low_volatility:
+                current_factor = factor * 0.5
+            elif current_volatility <= medium_volatility:
+                current_factor = factor
+            else:
+                current_factor = factor * 1.5
+
+            upperband = hl2.iloc[i] + current_factor * atr.iloc[i]
+            lowerband = hl2.iloc[i] - current_factor * atr.iloc[i]
+
+            if i > 0:
+                if supertrend.iloc[i - 1] <= upperband:
+                    supertrend.iloc[i] = min(upperband, supertrend.iloc[i - 1])
+                else:
+                    supertrend.iloc[i] = max(lowerband, supertrend.iloc[i - 1])
+
+                if close.iloc[i] > supertrend.iloc[i]:
+                    direction.iloc[i] = 1
+                elif close.iloc[i] < supertrend.iloc[i]:
+                    direction.iloc[i] = -1
+                else:
+                    direction.iloc[i] = direction.iloc[i - 1]
+            else:
+                supertrend.iloc[i] = (upperband + lowerband) / 2
+                direction.iloc[i] = 0
+
+        return direction
+
+    def ema_crossover(self, short_window, long_window):
+        """ EMA crossover sinyali """
+        short_ema = EMAIndicator(close=self.data['Kapanış(TL)'], window=short_window).ema_indicator()
+        long_ema = EMAIndicator(close=self.data['Kapanış(TL)'], window=long_window).ema_indicator()
+        signal = np.where(short_ema > long_ema, 1, -1)
+        return pd.Series(signal, index=self.data.index)
+
+
+    def macd_signal(self):
+        """ MACD sinyali """
+        macd = MACD(close=self.data['Kapanış(TL)'])
+        macd_diff = macd.macd() - macd.macd_signal()
+        signal = np.where(macd_diff > 0, 1, -1)
+        return pd.Series(signal, index=self.data.index)
+
+    def rsi_signal(self, window=14, overbought=65, oversold=35):
+        """ RSI sinyali """
+        rsi = RSIIndicator(close=self.data['Kapanış(TL)'], window=window).rsi()
+        signal = np.where(rsi < oversold, 1, np.where(rsi > overbought, -1, 0))
+        return pd.Series(signal, index=self.data.index)
+
+
+
+    def bollinger_bands_signal(self, window=20, window_dev=2):
+        """ Bollinger Band sinyali """
+        indicator_bb = BollingerBands(close=self.data['Kapanış(TL)'], window=window, window_dev=window_dev)
+        signal = np.where(self.data['Kapanış(TL)'] < indicator_bb.bollinger_lband(), 1,
+                        np.where(self.data['Kapanış(TL)'] > indicator_bb.bollinger_hband(), -1, 0))
+        return pd.Series(signal, index=self.data.index)
+
+
+    def psar_signal(self, step=0.02, max_step=0.2):
+        """ Parabolic SAR sinyali """
+        psar = PSARIndicator(high=self.data['Max(TL)'], low=self.data['Min(TL)'], close=self.data['Kapanış(TL)'],
+                            step=step, max_step=max_step)
+        signal = np.where(self.data['Kapanış(TL)'] > psar.psar(), 1, -1)
+        return pd.Series(signal, index=self.data.index)
+
+
+    def nbar_signal(self):
+        """ Geliştirilmiş NBAR sinyali """
+        reversals_with_strength = self.nbar_detector.get_reversals_with_strength()
+        signal = pd.Series(0, index=self.data.index)
+        for reversal_type, index, pattern_type, strength in reversals_with_strength:
+            if reversal_type == "Bullish":
+                signal.iloc[index] = strength
+            elif reversal_type == "Bearish":
+                signal.iloc[index] = -strength
+        return signal
+
+
+    def order_blocks_signal(self):
+        ob_signal = self.ob_detector.generate_ob_signal()
+        
+        
+        # Sinyal değerlerini -1 ile 1 arasında sınırla
+        ob_signal = ob_signal.clip(-1, 1)
+        
+        return ob_signal
+
+
+    def ichimoku_signal(self):
+        """ Ichimoku sinyali """
+        ichimoku = IchimokuIndicator(high=self.data['Max(TL)'], low=self.data['Min(TL)'])
+        tenkan = ichimoku.ichimoku_conversion_line()
+        kijun = ichimoku.ichimoku_base_line()
+        signal = np.where(tenkan > kijun, 1, np.where(tenkan < kijun, -1, 0))
+        return pd.Series(signal, index=self.data.index)
+
+
+    def stochastic_signal(self, window=14, smooth_window=3):
+        """ Stokastik osilatör sinyali """
+        stoch = StochasticOscillator(high=self.data['Max(TL)'], low=self.data['Min(TL)'], close=self.data['Kapanış(TL)'],
+                                    window=window, smooth_window=smooth_window)
+        signal = np.where(stoch.stoch_signal() > 80, -1, np.where(stoch.stoch_signal() < 20, 1, 0))
+        return pd.Series(signal, index=self.data.index)
+
+
+    def obv_signal(self):
+        """ On Balance Volume (OBV) sinyali """
+        obv = OnBalanceVolumeIndicator(close=self.data['Kapanış(TL)'], volume=self.data['Hacim(TL)'])
+        obv_sma = obv.on_balance_volume().rolling(window=20).mean()
+        signal = np.where(obv.on_balance_volume() > obv_sma, 1, -1)
+        return pd.Series(signal, index=self.data.index)
+
+
+    def support_resistance_signal(self, window=20):
+        """ Destek ve direnç sinyali """
+        pivot = (self.data['Max(TL)'] + self.data['Min(TL)'] + self.data['Kapanış(TL)']) / 3
+        support = pivot - (self.data['Max(TL)'] - self.data['Min(TL)'])
+        resistance = pivot + (self.data['Max(TL)'] - self.data['Min(TL)'])
+
+        support_ma = support.rolling(window=window).mean()
+        resistance_ma = resistance.rolling(window=window).mean()
+
+        signal = np.where(self.data['Kapanış(TL)'] < support_ma, 1,
+                        np.where(self.data['Kapanış(TL)'] > resistance_ma, -1, 0))
+        return pd.Series(signal, index=self.data.index)
+
+
+    def market_regime_signal(self, window=200):
+        """ Piyasa rejimi sinyali """
+        sma = EMAIndicator(close=self.data['Kapanış(TL)'], window=window).ema_indicator()
+        volatility = self.data['Kapanış(TL)'].pct_change().rolling(window=window).std()
+
+        trend = np.where(self.data['Kapanış(TL)'] > sma, 1, -1)
+        regime = np.where(volatility > volatility.mean(), 0, trend)
+
+        return pd.Series(regime, index=self.data.index)
+
+
+    def get_signals(self, step):
+        signals = {}
+        for name, signal in self.signals.items():
+            if isinstance(signal, pd.Series) and len(signal) > step:
+                raw_signal = signal.iloc[step]
+                # Sinyali -1 ile 1 arasında sınırla
+                normalized_signal = np.clip(raw_signal, -1, 1)
+                weighted_signal = normalized_signal * self.weights[name]
+                signals[name] = {"value": weighted_signal, "status": self.get_signal_status(weighted_signal)}
+            else:
+                print(f"Error: {name} signal is invalid or step exceeded.")
+                signals[name] = {"value": 0, "status": "N/A"}
+
+        # OrderBlocks için ayrı işlem yapalım
+        self.ob_detector.update_order_blocks()
+        ob_signal = self.order_blocks_signal().iloc[step]
+        normalized_ob_signal = np.clip(ob_signal, -1, 1)
+        signals['OrderBlocks'] = {"value": normalized_ob_signal * self.weights['OrderBlocks'], "status": self.get_signal_status(normalized_ob_signal)}
+
+        return signals
+    
+
+    def get_signal_status(self, signal_value):
+        abs_value = abs(signal_value)
+        
+        # Sinyal değerlerine göre durumları güncelle (Aralıklar genişletildi)
+        if abs_value > 0.5:  # Güçlü Al/Sat için aralığı genişletelim
+            return "🟢 Strong Buy" if signal_value > 0 else "🔴 Strong Sell"
+        elif abs_value > 0.2:  # Al/Sat için aralığı genişletelim
+            return "🟡 Buy" if signal_value > 0 else "🟠 Sell"
+        elif abs_value > 0.05:  # Nötr ve zayıf sinyaller için daha ince aralıklar
+            return "⚪ Weak Buy" if signal_value > 0 else "⚪ Weak Sell"
+        else:
+            return "⚪ Neutral"  # Tamamen nötr sadece çok düşük değerlerde olmalı
+
+
+
+
+    def get_total_signal(self, step):
+        signals = self.get_signals(step)
+        
+        # Extract only the 'value' from the signal dictionaries for summing
+        signal_values = [data['value'] for data in signals.values()]
+
+        # Now sum the signal values
+        total_signal = sum(signal_values)
+
+        # Print the total signal and its status
+        print(f"\n🔔 Total Signal: {total_signal:.4f}")
+        print(f"Overall Status: {self.get_signal_status(total_signal)}")
+        
+        return total_signal
+
+
+
+
+
+    
+    def print_signal_summary(self, signals, statuses):
+        for name, value in signals.items():
+            status = statuses[name]
+            weight = self.weights[name]
+    
+    
+    
+
+    def print_weights_and_usage(self):
+        """ Print the weights and usage counts """
+        print("\n🧮 Indicator Weights and Usage Counts:")
+        for signal in self.weights:
+            print(f"{signal}: Weight = {self.weights[signal]:.4f}, Usage Count = {self.usage_count[signal]}")
+        
+        most_used = max(self.usage_count, key=self.usage_count.get)
+        print(f"\n🔥 Most Used Indicator: {most_used} (Usage Count: {self.usage_count[most_used]})")
+
+    def reward_summary(self):
+        """ Print the reward history and current weights """
+        print("\n🏅 Reward History and Weights:")
+        for signal in self.reward_history:
+            avg_reward = np.mean(self.reward_history[signal]) if self.reward_history[signal] else 0
+            print(f"{signal}: Average Reward = {avg_reward:.4f}, Current Weight = {self.weights[signal]:.4f}")
+
+    def print_performance_summary(self):
+        print("\n🏆 Performance Summary:")
+        for signal, score in sorted(self.performance_score.items(), key=lambda x: x[1], reverse=True):
+            print(f"{signal}: Performance Score = {score:.4f}, Weight = {self.weights[signal]:.4f}")
