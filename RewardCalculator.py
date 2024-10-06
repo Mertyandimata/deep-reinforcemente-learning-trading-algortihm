@@ -7,9 +7,6 @@ class RewardCalculator:
         self.max_portfolio_value = 0
         self.drawdown_threshold = 0.1
         self.volatility_window = 20
-        self.max_drawdown = 0
-        self.consecutive_losses = 0
-        self.max_consecutive_losses = 0
 
     def calculate_total_reward(self, prev_value, current_value):
         base_reward = self.calculate_base_reward(prev_value, current_value)
@@ -19,28 +16,19 @@ class RewardCalculator:
         drawdown_penalty = self.calculate_drawdown_penalty(current_value)
         position_reward = self.calculate_position_reward()
         sharpe_ratio_reward = self.calculate_sharpe_ratio_reward()
-        
-        # Yeni ödül bileşenleri
-        consistency_reward = self.calculate_consistency_reward()
-        recovery_speed_reward = self.calculate_recovery_speed_reward()
-        market_impact_reward = self.calculate_market_impact_reward()
 
         total_reward = (
-            base_reward * 2 +  # Temel ödülün ağırlığını artır
-            trend_reward * 1.5 +  # Trend takibi önemli
-            risk_reward * 2 +  # Risk yönetimine daha fazla önem ver
+            base_reward +
+            trend_reward +
+            risk_reward +
             volatility_reward +
-            drawdown_penalty * 2 +  # Drawdown'a daha fazla ceza
-            position_reward * 1.5 +  # Pozisyon yönetimine daha fazla önem ver
-            sharpe_ratio_reward * 2 +  # Sharpe oranına daha fazla önem ver
-            consistency_reward +
-            recovery_speed_reward +
-            market_impact_reward
+            drawdown_penalty +
+            position_reward +
+            sharpe_ratio_reward
         )
 
         self.log_rewards(base_reward, trend_reward, risk_reward, volatility_reward, 
-                         drawdown_penalty, position_reward, sharpe_ratio_reward, 
-                         consistency_reward, recovery_speed_reward, market_impact_reward, total_reward)
+                         drawdown_penalty, position_reward, sharpe_ratio_reward, total_reward)
 
         return total_reward
 
@@ -140,44 +128,8 @@ class RewardCalculator:
         
         return 10 * sharpe_ratio  # Positive Sharpe ratio is rewarded, negative is penalized
 
-    def calculate_consistency_reward(self):
-        if self.env.trades:
-            last_trade = self.env.trades[-1]
-            if last_trade['type'] == 'sell':
-                profit = last_trade['price'] - self.env.entry_price
-                if profit > 0:
-                    self.consecutive_losses = 0
-                    return 5  # Tutarlı kazanç için ödül
-                else:
-                    self.consecutive_losses += 1
-                    self.max_consecutive_losses = max(self.max_consecutive_losses, self.consecutive_losses)
-                    return -2 * self.consecutive_losses  # Ardışık kayıplar için artan ceza
-        return 0
-
-    def calculate_recovery_speed_reward(self):
-        if self.max_drawdown > 0:
-            current_drawdown = self.calculate_current_drawdown()
-            recovery_speed = (self.max_drawdown - current_drawdown) / self.max_drawdown
-            return 10 * recovery_speed  # Hızlı toparlanma için ödül
-        return 0
-
-    def calculate_market_impact_reward(self):
-        if self.env.position != 0:
-            position_value = abs(self.env.position) * self.env.data['Kapanış(TL)'].iloc[self.env.current_step]
-            daily_volume = self.env.data['Hacim(TL)'].iloc[self.env.current_step]
-            market_impact = position_value / daily_volume
-            return -10 * market_impact  # Yüksek piyasa etkisi için ceza
-        return 0
-
-    def calculate_current_drawdown(self):
-        current_value = self.env.balance + self.env.position * self.env.data['Kapanış(TL)'].iloc[self.env.current_step]
-        drawdown = (self.max_portfolio_value - current_value) / self.max_portfolio_value
-        self.max_drawdown = max(self.max_drawdown, drawdown)
-        return drawdown
-
     def log_rewards(self, base_reward, trend_reward, risk_reward, volatility_reward, 
-                    drawdown_penalty, position_reward, sharpe_ratio_reward, 
-                    consistency_reward, recovery_speed_reward, market_impact_reward, total_reward):
+                    drawdown_penalty, position_reward, sharpe_ratio_reward, total_reward):
         print(f"📊 Ödül Bileşenleri:")
         print(f"🔹 Temel Ödül: {base_reward:.2f}")
         print(f"📈 Trend Ödülü: {trend_reward:.2f}")
@@ -186,7 +138,4 @@ class RewardCalculator:
         print(f"📉 Drawdown Cezası: {drawdown_penalty:.2f}")
         print(f"💼 Pozisyon Ödülü: {position_reward:.2f}")
         print(f"📈 Sharpe Oranı Ödülü: {sharpe_ratio_reward:.2f}")
-        print(f"🔄 Tutarlılık Ödülü: {consistency_reward:.2f}")
-        print(f"🚀 Toparlanma Hızı Ödülü: {recovery_speed_reward:.2f}")
-        print(f"🌊 Piyasa Etkisi Ödülü: {market_impact_reward:.2f}")
         print(f"💰 Toplam Ödül: {total_reward:.2f}")
